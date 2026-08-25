@@ -104,6 +104,7 @@ function getMarkupFormatter(): Promise<ContextFormatter> {
     });
     const formatter = context.addPlugin(plugin, {
       maxAttrsPerLine: 1,
+      closingBracketSameLine: true,
       "component.selfClosing": true,
     });
     const diagnostics = formatter.getConfigDiagnostics();

@@ -59,7 +59,7 @@ describe("single-process space server", () => {
     try {
       const { id, url } = await createSpace(app);
       const html = await Bun.file(join(directory, id, "index.html")).text();
-      expect(html).toContain('<article\n  id="document-root"\n  class="document-page"\n>');
+      expect(html).toContain('<article\n  id="document-root"\n  class="document-page">');
       expect(html).toContain("Quarterly launch plan");
       expect(html).toContain("\n  <header");
       expect(html.endsWith("\n")).toBe(true);

@@ -20,6 +20,7 @@
   },
   "markup": {
     "maxAttrsPerLine": 1,
+    "closingBracketSameLine": true,
     "component.selfClosing": true
   },
   "sql": {
