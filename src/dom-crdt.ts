@@ -27,6 +27,8 @@ type UpdateListener = (update: Uint8Array) => void;
 export interface CreateDomCrdtOptions {
   root: Element;
   doc?: LoroDoc;
+  /** Origin attached to local DOM-derived Loro commits. */
+  origin?: string;
 }
 
 export interface DomCrdtSync {
@@ -178,7 +180,7 @@ class DomCrdtSyncImpl implements DomCrdtSync {
   private readonly idToDom = new Map<TreeID, Node>();
   private readonly domToId = new WeakMap<Node, TreeID>();
   private readonly updateListeners = new Set<UpdateListener>();
-  private readonly localOrigin = `dom-crdt:${crypto.randomUUID()}`;
+  private readonly localOrigin: string;
   private readonly observer: MutationObserver;
   private readonly unsubscribeDoc: () => void;
   private readonly unsubscribeLocalUpdates: () => void;
@@ -190,6 +192,7 @@ class DomCrdtSyncImpl implements DomCrdtSync {
   constructor(options: CreateDomCrdtOptions) {
     this.root = options.root;
     this.doc = options.doc ?? new LoroDoc();
+    this.localOrigin = options.origin ?? `dom-crdt:${crypto.randomUUID()}`;
     this.tree = this.doc.getTree(TREE_NAME);
     this.tree.enableFractionalIndex(16);
 

@@ -15,13 +15,21 @@ bun run dev
 ```
 
 Open `http://localhost:3000`. The server redirects through `/spaces` to `/spaces/:uuid`. Each space uses a
-`BroadcastChannel` named from that ID and stores Loro snapshot bytes in `localStorage`, so the space retains the same
-CRDT identity graph when reopened.
+single in-process server actor, a Bun WebSocket, and a pretty-printed plain HTML file at
+`data/spaces/:uuid/index.html`.
 
 Each tab renders one plain document: editable heading and body text, plus a draggable, editable list. A fixed sidebar
 shows the current CRDT identity tree, raw Loro state, and every local/import/network event as it streams. Open the exact
-same `/spaces/:uuid` URL in another tab to create an independent `LoroDoc` replica; tabs hydrate from the stored snapshot
-and exchange update bytes through a hello/full-update `BroadcastChannel` handshake.
+same `/spaces/:uuid` URL in another tab to create an independent `LoroDoc` replica. Each tab hydrates from the actor's
+snapshot and streams binary Loro updates through the server WebSocket. Editing the corresponding HTML file is also
+observed and committed by the server with the Loro origin `origin`, then streamed to connected peers.
+Filesystem HTML is reconciled into the actor DOM incrementally, preserving compatible nodes and keyed moves instead of
+replacing the whole subtree for each save.
+
+`GET /spaces` creates the HTML file and redirects to it. `GET /spaces/:id` and its WebSocket return 404 when the file
+does not exist. Actors are cached by space ID and serialize all file/network work through a per-space queue. This is
+intentionally a poor man's durable object: it assumes exactly one server process and provides no cross-process locking,
+coordination, or failover. CRDT history is in memory; the restart format is deliberately just editable HTML.
 
 ## API
 
@@ -56,7 +64,7 @@ for the latter form.
 Presence is a separate ephemeral pipeline. It is never written to `LoroDoc`, so it cannot enter update bytes,
 snapshots, persisted state, or history. The small state store only handles sequencing, heartbeats, expiry, and transport;
 the DOM controller only handles selection capture and rendering. They are connected by a point adapter, so neither
-piece depends on BroadcastChannel or the DOM CRDT implementation.
+piece depends on WebSockets or the DOM CRDT implementation.
 
 ```ts
 import {

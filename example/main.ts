@@ -4,26 +4,28 @@ import {
   createDomPresence,
   createPresenceStore,
   LoroDoc,
-  type DomCrdtSync,
   type Presence,
   type PresencePoint,
 } from "../src/index.ts";
 import type { LoroEvent, LoroEventBatch } from "loro-crdt";
 
-type ChannelMessage =
-  | { kind: "hello" | "goodbye"; sender: string; target?: string }
-  | { kind: "presence"; sender: string; target?: string; presence: Presence<PresencePoint> }
-  | { kind: "update"; sender: string; target?: string; update: Uint8Array };
+type ServerMessage =
+  | { kind: "peers"; peers: string[] }
+  | { kind: "peer-joined" | "peer-left"; peerId: string }
+  | { kind: "presence"; sender: string; presence: Presence<PresencePoint> };
 
-const root = requiredElement<HTMLElement>("#document-root");
+const root = requiredElement<HTMLElement>("#space-root");
 const spaceId = decodeURIComponent(location.pathname.split("/").filter(Boolean).at(-1) ?? "local");
 const tabId = crypto.randomUUID();
-const storageKey = `domsyn:space:${spaceId}`;
-const channel = new BroadcastChannel(`domsyn:${spaceId}`);
-const storedSnapshot = readStoredSnapshot();
+const socketUrl = new URL(`/spaces/${encodeURIComponent(spaceId)}/ws`, location.href);
+socketUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+socketUrl.searchParams.set("peer", tabId);
+const socket = new WebSocket(socketUrl);
+socket.binaryType = "arraybuffer";
+const initialSnapshot = await receiveInitialSnapshot(socket);
 const sync = createDomCrdt({
   root,
-  doc: storedSnapshot ? LoroDoc.fromSnapshot(storedSnapshot) : undefined,
+  doc: LoroDoc.fromSnapshot(initialSnapshot),
 });
 const presenceLayer = requiredElement<HTMLElement>("#presence-layer");
 const presenceStore = createPresenceStore<PresencePoint>({
@@ -31,7 +33,9 @@ const presenceStore = createPresenceStore<PresencePoint>({
   name: `Peer ${shortId(tabId)}`,
   color: peerColor(tabId),
   send: (presence) => {
-    channel.postMessage({ kind: "presence", sender: tabId, presence } satisfies ChannelMessage);
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(wireStringify({ kind: "presence", presence }));
+    }
   },
 });
 const presence = createDomPresence({
@@ -57,11 +61,12 @@ normalizeDragHandles();
 sync.flush();
 
 const unsubscribeUpdates = sync.onUpdate((update) => {
-  channel.postMessage({ kind: "update", sender: tabId, update } satisfies ChannelMessage);
-  appendEvent("outgoing", `Broadcast ${formatBytes(update.byteLength)} update`, {
+  const payload = new ArrayBuffer(update.byteLength);
+  new Uint8Array(payload).set(update);
+  socket.send(payload);
+  appendEvent("outgoing", `Sent ${formatBytes(update.byteLength)} update`, {
     bytes: update.byteLength,
   }, update.byteLength);
-  queueMicrotask(() => persist(sync));
 });
 
 const unsubscribeDoc = sync.doc.subscribe((batch) => {
@@ -69,29 +74,12 @@ const unsubscribeDoc = sync.doc.subscribe((batch) => {
   queueMicrotask(renderState);
 });
 
-channel.addEventListener("message", (event: MessageEvent<ChannelMessage>) => {
-  const message = event.data;
-  if (!message || message.sender === tabId || (message.target && message.target !== tabId)) return;
-  peers.add(message.sender);
-
-  if (message.kind === "hello") {
-    channel.postMessage({
-      kind: "update",
-      sender: tabId,
-      target: message.sender,
-      update: sync.getUpdate(),
-    } satisfies ChannelMessage);
-    presenceStore.broadcastLocal();
-  } else if (message.kind === "goodbye") {
-    peers.delete(message.sender);
-    presenceStore.remove(message.sender);
-  } else if (message.kind === "presence" && message.presence.peerId === message.sender) {
-    presenceStore.receive(message.presence);
-  } else if (message.kind === "update") {
-    const update = new Uint8Array(message.update);
+socket.addEventListener("message", async (event) => {
+  if (typeof event.data !== "string") {
+    const update = await messageBytes(event.data);
     appendEvent("incoming", `Received ${formatBytes(update.byteLength)} update`, {
       bytes: update.byteLength,
-      sender: shortId(message.sender),
+      sender: "server",
     }, update.byteLength);
     importingUpdateBytes = update.byteLength;
     try {
@@ -99,10 +87,37 @@ channel.addEventListener("message", (event: MessageEvent<ChannelMessage>) => {
     } finally {
       importingUpdateBytes = undefined;
     }
-    persist(sync);
     presence.refresh();
+    renderConnection();
+    return;
   }
 
+  let message: ServerMessage;
+  try {
+    message = wireParse<ServerMessage>(event.data);
+  } catch {
+    return;
+  }
+
+  if (message.kind === "peers") {
+    peers.clear();
+    for (const peerId of message.peers) peers.add(peerId);
+  } else if (message.kind === "peer-joined") {
+    peers.add(message.peerId);
+    presenceStore.broadcastLocal();
+  } else if (message.kind === "peer-left") {
+    peers.delete(message.peerId);
+    presenceStore.remove(message.peerId);
+  } else if (message.kind === "presence" && message.presence.peerId === message.sender) {
+    peers.add(message.sender);
+    presenceStore.receive(message.presence);
+  }
+
+  renderConnection();
+});
+
+socket.addEventListener("close", () => {
+  peers.clear();
   renderConnection();
 });
 
@@ -311,8 +326,14 @@ function renderState(): void {
 
 function renderConnection(): void {
   const output = requiredElement<HTMLOutputElement>("#connection-status");
+  if (socket.readyState !== WebSocket.OPEN) {
+    output.value = socket.readyState === WebSocket.CONNECTING ? "Connecting" : "Disconnected";
+    return;
+  }
   const count = peers.size;
-  output.value = count === 0 ? "Live · waiting for another tab" : `Live · ${count} other tab${count === 1 ? "" : "s"}`;
+  output.value = count === 0
+    ? "Live · waiting for another tab"
+    : `Live · ${count} other tab${count === 1 ? "" : "s"}`;
 }
 
 function renderEventCount(): void {
@@ -338,37 +359,64 @@ function safeStringify(value: unknown): string {
   return JSON.stringify(value, (_key, item) => typeof item === "bigint" ? item.toString() : item, 2);
 }
 
-function readStoredSnapshot(): Uint8Array | undefined {
-  const encoded = localStorage.getItem(storageKey);
-  if (!encoded) return undefined;
-  try {
-    const binary = atob(encoded);
-    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  } catch {
-    localStorage.removeItem(storageKey);
-    return undefined;
-  }
+function wireStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, item) =>
+    item instanceof Uint8Array ? { __domsynBytes: Array.from(item) } : item
+  );
 }
 
-function persist(target: DomCrdtSync): void {
-  const snapshot = target.getSnapshot();
-  let binary = "";
-  for (const byte of snapshot) binary += String.fromCharCode(byte);
-  localStorage.setItem(storageKey, btoa(binary));
+function wireParse<T>(encoded: string): T {
+  return JSON.parse(encoded, (_key, item) => {
+    if (
+      typeof item === "object" &&
+      item !== null &&
+      Array.isArray((item as { __domsynBytes?: unknown }).__domsynBytes)
+    ) {
+      return Uint8Array.from((item as { __domsynBytes: number[] }).__domsynBytes);
+    }
+    return item;
+  }) as T;
 }
 
-persist(sync);
+function messageBytes(data: ArrayBuffer | Blob): Promise<Uint8Array> {
+  if (data instanceof ArrayBuffer) return Promise.resolve(new Uint8Array(data));
+  return data.arrayBuffer().then((buffer) => new Uint8Array(buffer));
+}
+
+function receiveInitialSnapshot(target: WebSocket): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      target.removeEventListener("message", onMessage);
+      target.removeEventListener("error", onError);
+      target.removeEventListener("close", onClose);
+    };
+    const onMessage = (event: MessageEvent<ArrayBuffer | Blob | string>) => {
+      if (typeof event.data === "string") return;
+      cleanup();
+      void messageBytes(event.data).then(resolve, reject);
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error("Could not connect to the space WebSocket"));
+    };
+    const onClose = (event: CloseEvent) => {
+      cleanup();
+      reject(new Error(`Space WebSocket closed before hydration (${event.code})`));
+    };
+    target.addEventListener("message", onMessage);
+    target.addEventListener("error", onError);
+    target.addEventListener("close", onClose);
+  });
+}
+
 renderState();
-appendEvent("system", storedSnapshot ? "Hydrated the DOM from the stored CRDT snapshot" : "Imported the initial DOM into a new CRDT");
-channel.postMessage({ kind: "hello", sender: tabId } satisfies ChannelMessage);
+appendEvent("system", "Hydrated the DOM from the server space actor");
 
 window.addEventListener("beforeunload", () => {
-  channel.postMessage({ kind: "goodbye", sender: tabId } satisfies ChannelMessage);
-  persist(sync);
   unsubscribeDoc();
   unsubscribeUpdates();
   presence.destroy();
   presenceStore.destroy();
-  channel.close();
+  socket.close();
   sync.destroy();
 });

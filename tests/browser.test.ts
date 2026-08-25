@@ -1,6 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtemp, rename, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
-import demoPage from "../example/index.html";
+import { createSpaceServer, type SpaceServer } from "../example/server.ts";
 
 async function eventually<T>(
   read: () => Promise<T>,
@@ -26,7 +29,8 @@ async function waitForSpace(page: Page): Promise<void> {
 }
 
 describe("real browser multi-tab integration", () => {
-  let server: ReturnType<typeof Bun.serve>;
+  let app: SpaceServer;
+  let spacesDirectory: string;
   let browser: Browser;
   let context: BrowserContext;
   let pageA: Page;
@@ -35,10 +39,14 @@ describe("real browser multi-tab integration", () => {
   let spaceUrl: string;
 
   beforeAll(async () => {
-    server = Bun.serve({ port: 0, routes: { "/spaces/:id": demoPage } });
+    spacesDirectory = await mkdtemp(join(tmpdir(), "domsyn-browser-"));
+    app = await createSpaceServer({ port: 0, spacesDirectory, development: false });
     browser = await chromium.launch({ headless: true });
     context = await browser.newContext();
-    spaceUrl = new URL(`/spaces/browser-${crypto.randomUUID()}`, server.url).href;
+    const creation = await fetch(new URL("/spaces", app.server.url), { redirect: "manual" });
+    const location = creation.headers.get("location");
+    if (!location) throw new Error("Space creation did not return a location");
+    spaceUrl = new URL(location, app.server.url).href;
     pageA = await context.newPage();
     await pageA.goto(spaceUrl);
     await waitForSpace(pageA);
@@ -59,7 +67,8 @@ describe("real browser multi-tab integration", () => {
     await pageA?.close();
     await context?.close();
     await browser?.close();
-    server?.stop(true);
+    await app?.stop();
+    if (spacesDirectory) await rm(spacesDirectory, { recursive: true, force: true });
   }, 15_000);
 
   test("ordinary DOM text and list creation stream to another tab", async () => {
@@ -280,7 +289,7 @@ describe("real browser multi-tab integration", () => {
         bounds.y + bounds.height - 3,
         { steps: 4 },
       );
-      // Let MutationObserver commit and BroadcastChannel deliver each
+      // Let MutationObserver commit and the WebSocket relay deliver each
       // intermediate reorder before continuing the same pointer gesture.
       await pageA.waitForTimeout(80);
       expect(await pageA.locator("#task-list .task-item").count()).toBe(initialCount);
@@ -386,5 +395,60 @@ describe("real browser multi-tab integration", () => {
       pageC.locator("#crdt-tree").textContent(),
     ]);
     expect(new Set(trees).size).toBe(1);
+  }, 10_000);
+
+  test("an HTML file edit is committed by origin and reaches every connected browser", async () => {
+    const id = new URL(spaceUrl).pathname.split("/").at(-1);
+    if (!id) throw new Error("Missing space id");
+    const path = join(spacesDirectory, id, "index.html");
+    const currentTitle = await pageA.locator("#document-root h1").textContent();
+    if (!currentTitle) throw new Error("Missing current title");
+    const before = await eventually(
+      () => Bun.file(path).text(),
+      (html) => html.includes(currentTitle),
+    );
+    const diskTitle = "A plan edited directly on disk";
+    const connectedPages = pageC ? [pageA, pageB, pageC] : [pageA, pageB];
+    const actor = await app.spaces.get(id);
+    if (!actor) throw new Error("Missing active space actor");
+    const origins: Array<string | undefined> = [];
+    const treeActions: string[] = [];
+    const updateSizes: number[] = [];
+    const unsubscribeUpdates = actor.sync.onUpdate((update) => updateSizes.push(update.byteLength));
+    const unsubscribeDoc = actor.sync.doc.subscribe((batch) => {
+      origins.push(batch.origin);
+      if (batch.origin !== "origin") return;
+      for (const event of batch.events) {
+        if (event.diff.type === "tree") {
+          treeActions.push(...event.diff.diff.map(({ action }) => action));
+        }
+      }
+    });
+
+    try {
+      const temporaryPath = join(spacesDirectory, id, ".index.html.tmp");
+      await Bun.write(temporaryPath, before.replace(currentTitle, diskTitle));
+      await rename(temporaryPath, path);
+
+      const titles = await eventually(
+        () => Promise.all(connectedPages.map((page) =>
+          page.locator("#document-root h1").textContent()
+        )),
+        (values) => values.every((value) => value === diskTitle),
+      );
+      expect(titles).toEqual(connectedPages.map(() => diskTitle));
+      expect(origins).toContain("origin");
+      expect(treeActions).toEqual([]);
+      expect(updateSizes).toHaveLength(1);
+      expect(updateSizes[0]!).toBeLessThan(1_000);
+
+      const trees = await Promise.all(connectedPages.map((page) =>
+        page.locator("#crdt-tree").textContent()
+      ));
+      expect(new Set(trees).size).toBe(1);
+    } finally {
+      unsubscribeDoc();
+      unsubscribeUpdates();
+    }
   }, 10_000);
 });
