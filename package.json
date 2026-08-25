@@ -1,0 +1,25 @@
+{
+  "name": "domsyn",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun --hot example/server.ts",
+    "start": "bun example/server.ts",
+    "test": "bun test",
+    "test:browser": "bun test tests/browser.test.ts",
+    "browser:install": "bunx playwright install chromium",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "happy-dom": "20.11.6",
+    "playwright": "1.62.1"
+  },
+  "peerDependencies": {
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "loro-crdt": "1.14.1"
+  }
+}
